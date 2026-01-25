@@ -1,7 +1,7 @@
 from ultralytics import YOLO
 
 # 加载模型（首次会自动下载 yolov10n.pt）
-model = YOLO("D:\\python_projects\\dpsk-test\\edge\\runs\\detect\\transformer_project\\yolov10_test8\\weights\\best.pt")
+model = YOLO("D:\\python_projects\\dpsk-test\\edge\\runs\\detect\\transformer_project\\yolov10_test6\\weights\\best.pt")
 #model = YOLO("yolov10n.pt")
 
 # 推理

@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>变压器云端监控系统</title>
+    <style>
+        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: #1a1a1a; color: white; text-align: center; transition: background 0.5s; }
+        .container { margin-top: 50px; }
+        .card { background: #2d2d2d; border-radius: 15px; display: inline-block; padding: 20px; box-shadow: 0 10px 30px rgba(0,0,0,0.5); }
+        #monitor-img { max-width: 600px; border-radius: 10px; border: 3px solid #444; }
+        .status-box { margin-top: 20px; padding: 15px; border-radius: 8px; font-size: 24px; font-weight: bold; }
+        .alarm { background: #ff4757; animation: blink 1s infinite; }
+        .normal { background: #2ed573; }
+        @keyframes blink { 0% { opacity: 1; } 50% { opacity: 0.7; } 100% { opacity: 1; } }
+        .info { margin-top: 10px; color: #ccc; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Transformer Cloud Monitor <span id="clock"></span></h1>
+        <div class="card">
+            <img id="monitor-img" src="https://via.placeholder.com/600x400?text=Waiting+for+Data..." />
+            <div id="status-bar" class="status-box normal">系统运行中</div>
+            <div class="info">触发原因: <span id="trigger-reason">-</span></div>
+            <div class="info">AI 诊断: <span id="ai-detail">-</span></div>
+        </div>
+    </div>
+
+    <script>
+        async function updateStatus() {
+            try {
+                const res = await fetch('/get_latest');
+                const data = await res.json();
+
+                if (data.img_url) {
+                    document.getElementById('monitor-img').src = data.img_url + '?t=' + new Date().getTime();
+                    document.getElementById('trigger-reason').innerText = data.reason;
+                    document.getElementById('ai-detail').innerText = data.detail;
+
+                    const bar = document.getElementById('status-bar');
+                    if (data.is_fire) {
+                        bar.innerText = "🔥 警告：检测到火灾！";
+                        bar.className = "status-box alarm";
+                        document.body.style.background = "#4a0000";
+                    } else {
+                        bar.innerText = "✅ 运行正常";
+                        bar.className = "status-box normal";
+                        document.body.style.background = "#1a1a1a";
+                    }
+                }
+            } catch (e) { console.log("等待数据..."); }
+        }
+        setInterval(updateStatus, 2000); // 每2秒刷新一次网页状态
+        setInterval(() => { document.getElementById('clock').innerText = new Date().toLocaleTimeString(); }, 1000);
+    </script>
+</body>
+</html>
