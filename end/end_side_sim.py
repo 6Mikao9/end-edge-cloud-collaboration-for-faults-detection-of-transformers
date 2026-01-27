@@ -157,5 +157,5 @@ class EndSideSimulator:
 
 if __name__ == "__main__":
     # inference_interval=1.0 表示每秒睁眼看一次，但视频播放是正常的 30FPS
-    simulator = EndSideSimulator(inference_interval=1.0)
+    simulator = EndSideSimulator(inference_interval=2.0)
     simulator.run(show_preview=True)
