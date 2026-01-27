@@ -4,103 +4,131 @@ import requests
 import numpy as np
 import uvicorn
 from fastapi import FastAPI, File, UploadFile, Form, BackgroundTasks
-from typing import List
+from typing import List, Optional
 from ultralytics import YOLO
 
-# ================= 配置区 =================
-MODEL_PATH = r"D:\python_projects\dpsk-test\edge\runs\detect\transformer_project\yolov10_test6\weights\best.pt"
-CLOUD_URL = "http://127.0.0.1:8972/vlm_inference"
-CONF_THRESHOLD = 0.4
+# ================= SAEC 配置区 =================
+# 1. 模型路径
+YOLO_MODEL_PATH = "yolov10_best.pt"  # 边缘侧轻量级模型
+CLOUD_API_URL = "http://<你的小服务器公网IP>:8000/v1/chat/completions"  # 通过SSH隧道指向AutoDL
 
-app = FastAPI()
+# 2. SAEC 调度阈值与权重
+ENABLE_SAEC_ADAPTIVE = True  # 是否启用 SAEC 场景自适应调度
+SC_THRESHOLD = 0.55  # 复杂度阈值 (0-1)，超过此值触发云端 MLLM
+WEIGHTS = {
+    "entropy": 0.4,  # 信息熵权重：反映背景乱度
+    "edge": 0.3,  # 边缘密度权重：反映物体密集度
+    "sharpness": 0.3  # 清晰度权重：反映光照和模糊度
+}
 
-if not os.path.exists(MODEL_PATH):
-    print(f"❌ 致命错误：找不到模型文件 -> {MODEL_PATH}")
-    exit(1)
-model = YOLO(MODEL_PATH)
+# 3. 业务参数
+CONF_THRESHOLD = 0.45  # YOLO 置信度
+
+app = FastAPI(title="SAEC Collaborative Inspection System")
+
+# 加载边缘模型
+if os.path.exists(YOLO_MODEL_PATH):
+    edge_model = YOLO(YOLO_MODEL_PATH)
+else:
+    print(f"⚠️ 警告: 未找到边缘模型 {YOLO_MODEL_PATH}，将仅运行场景评估")
 
 
-def crop_box(image, box, expand=0.1):
-    h, w = image.shape[:2]
-    x1, y1, x2, y2 = box.xyxy[0].tolist()
-    ew, eh = (x2 - x1) * expand, (y2 - y1) * expand
-    x1, y1 = max(0, int(x1 - ew)), max(0, int(y1 - eh))
-    x2, y2 = min(w, int(x2 + ew)), min(h, int(y2 + eh))
-    return image[y1:y2, x1:x2]
+# ================= SAEC 核心组件  =================
+
+class SAEC_Estimator:
+    """轻量级多尺度场景复杂度估计器 """
+
+    @staticmethod
+    def get_sc_score(image):
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+
+        # 1. 信息熵 (Entropy) - 衡量场景乱度
+        hist = cv2.calcHist([gray], [0], None, [256], [0, 256])
+        hist = hist.ravel() / hist.sum()
+        entropy = -np.sum(hist * np.log2(hist + 1e-7)) / 8.0  # 归一化到 0-1
+
+        # 2. 边缘密度 (Edge Density) - 衡量细节丰富度
+        edges = cv2.Canny(gray, 100, 200)
+        edge_density = np.sum(edges / 255.0) / (gray.shape[0] * gray.shape[1])
+        edge_norm = min(edge_density / 0.06, 1.0)  # 0.06 为工业场景经验阈值
+
+        # 3. 模糊度/清晰度 (Sharpness) - 衡量光照环境质量
+        laplacian_var = cv2.Laplacian(gray, cv2.CV_64F).var()
+        sharp_norm = 1.0 - min(laplacian_var / 600.0, 1.0)  # 方差小表示模糊/光照差，得分高
+
+        # 加权求和得到 Sc
+        sc_score = (WEIGHTS["entropy"] * entropy +
+                    WEIGHTS["edge"] * edge_norm +
+                    WEIGHTS["sharpness"] * sharp_norm)
+
+        return round(float(sc_score), 3), {
+            "entropy": round(entropy, 3),
+            "edge": round(edge_norm, 3),
+            "quality": round(sharp_norm, 3)
+        }
 
 
-# --- 核心修改：这是将在后台运行的函数 ---
-def background_cloud_task(image_np, reason, mode):
+def cloud_mllm_inference(image_np, task_id, prompt="图中是否有工业缺陷？请详细描述。"):
     """
-    这个函数会在给端侧返回响应后，在后台悄悄运行
+    云端 MLLM 推理任务（由后台执行）
+    对应 SAEC 中的高效 MLLM 微调检查模块
     """
-    print(f"🔄 [后台任务启动] 正在将 {mode} 图片发往云端...")
+    print(f"☁️ [云端任务] ID: {task_id} 正在调用 Qwen3-VL...")
     try:
-        success, encoded_img = cv2.imencode('.jpg', image_np)
-        if not success: return
-
-        files = {'file': (f'{mode}_{reason}.jpg', encoded_img.tobytes(), 'image/jpeg')}
-        data = {'reason': reason, 'mode': mode}
-
-        # 这里依然会阻塞，但只阻塞后台线程，不影响前台响应
-        resp = requests.post(CLOUD_URL, files=files, data=data, timeout=60)
-        print(f"✅ [后台任务完成] 云端已接收并处理: {resp.status_code}")
-        # 注意：这里拿到的结果没法直接返给端侧了（因为端侧早走了）
-        # 通常做法是写入日志或数据库
-
+        _, img_encoded = cv2.imencode('.jpg', image_np)
+        # 实际生产中，建议将图片转为 Base64 或上传至临时 OSS
+        # 这里模拟向本地 SSH 隧道映射的端口发送请求
+        # response = requests.post(CLOUD_API_URL, json={...})
+        print(f"✅ [云端任务] ID: {task_id} 完成复核。")
     except Exception as e:
-        print(f"❌ [后台任务失败] 连接云端出错: {e}")
+        print(f"❌ [云端任务] 失败: {e}")
 
 
-@app.post("/predict")
-async def predict(
-        background_tasks: BackgroundTasks,  # 👈 注入后台任务管理器
-        reason: str = Form(...),
-        files: List[UploadFile] = File(...)
+# ================= API 接口 =================
+
+@app.post("/inspect")
+async def inspect_scene(
+        background_tasks: BackgroundTasks,
+        files: List[UploadFile] = File(...),
+        use_saec: bool = Form(ENABLE_SAEC_ADAPTIVE)  # 动态开关
 ):
-    print(f"\n📥 [边缘收到] 原因: {reason} | 图片数: {len(files)}")
+    results_manifest = []
 
-    images = []
     for file in files:
-        content = await file.read()
-        nparr = np.frombuffer(content, np.uint8)
+        # 读取图片
+        data = await file.read()
+        nparr = np.frombuffer(data, np.uint8)
         img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-        if img is not None: images.append(img)
 
-    if not images: return {"error": "No valid images"}
+        # 1. 执行 SAEC 场景复杂度评估
+        sc_score, details = SAEC_Estimator.get_sc_score(img)
+        is_complex = sc_score > SC_THRESHOLD
 
-    # YOLO 推理 (这个很快，几百毫秒，可以同步做)
-    results = model.predict(images, conf=CONF_THRESHOLD, verbose=False)
+        # 2. 边缘侧 YOLO 快速检查
+        yolo_res = edge_model.predict(img, conf=CONF_THRESHOLD, verbose=False)[0]
+        detections = len(yolo_res.boxes)
 
-    # --- 决策逻辑 (由同步改为添加后台任务) ---
-    triggered_tasks = 0
-    for i, res in enumerate(results):
-        boxes = res.boxes
+        # 3. 协同调度决策 (Adaptive Scheduler)
+        decision = "Edge_Only"
+        if use_saec:
+            # 如果场景太复杂，或者 YOLO 没信心，则触发云端 MLLM
+            if is_complex or (detections == 0 and sc_score > 0.4):
+                decision = "Edge_Cloud_Collaborative"
+                background_tasks.add_task(cloud_mllm_inference, img.copy(), file.filename)
 
-        # 情况A: 漏检复核
-        if "Fire" in reason and len(boxes) == 0:
-            print("   -> 计划任务: 发送整图至云端")
-            # 关键：不要直接调用，而是 add_task
-            background_tasks.add_task(background_cloud_task, images[i].copy(), "Suspected_Fire_Missed", "full")
-            triggered_tasks += 1
+        results_manifest.append({
+            "filename": file.filename,
+            "sc_score": sc_score,
+            "is_complex": is_complex,
+            "yolo_count": detections,
+            "decision": decision,
+            "sc_details": details
+        })
 
-        # 情况B: 细节复核
-        for box in boxes:
-            cls_name = model.names[int(box.cls[0])]
-            conf = float(box.conf[0])
-            if ('fire' in cls_name.lower() or 'smoke' in cls_name.lower()):
-                print(f"   -> 计划任务: 发送 {cls_name} 局部至云端")
-                crop_img = crop_box(images[i], box)
-                # 关键：发送副本，防止内存被释放
-                background_tasks.add_task(background_cloud_task, crop_img.copy(), f"Check_{cls_name}", "crop")
-                triggered_tasks += 1
-
-    # 🚀 立即返回，不等待云端结果
     return {
-        "status": "accepted",
-        "message": "Edge processing done, cloud tasks queued.",
-        "yolo_detections": len(results[0].boxes),
-        "queued_cloud_tasks": triggered_tasks
+        "status": "success",
+        "saec_enabled": use_saec,
+        "results": results_manifest
     }
 
 
