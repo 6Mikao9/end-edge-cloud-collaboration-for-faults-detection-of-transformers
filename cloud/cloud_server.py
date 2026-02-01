@@ -23,6 +23,7 @@ from threading import Lock
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException
 from fastapi.responses import JSONResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
 
 # ================= 日志与配置 =================
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -46,10 +47,21 @@ class Device:
     edge_id: str
     first_seen: float
     last_seen: float
-    status: str = "online"  # online/offline/normal/warning
+    status: str = "online"  # online/offline/normal/warning/danger
     total_inspections: int = 0
     last_alert: Optional[Dict] = None
     last_alert_time: Optional[float] = None  # 最后报警时间戳
+
+
+@dataclass
+class EdgeServer:
+    """边缘服务器状态"""
+    edge_id: str
+    first_seen: float
+    last_heartbeat: float
+    status: str = "online"  # online/offline
+    device_count: int = 0
+    ip_address: Optional[str] = None
 
 @dataclass
 class InspectionRecord:
@@ -68,9 +80,12 @@ class InspectionRecord:
 class StateManager:
     def __init__(self):
         self.devices: Dict[str, Device] = {}
+        self.edges: Dict[str, EdgeServer] = {}  # 边缘服务器状态
         self.records: List[InspectionRecord] = []
         self.max_records = 100
         self._lock = Lock()
+        self.device_timeout = 60  # 设备超时时间（秒），超过则标记为离线
+        self.edge_timeout = 120   # 边缘服务器超时时间（秒）
 
     def update_device(self, device_id: str, edge_id: str, status: str = "online"):
         with self._lock:
@@ -79,7 +94,45 @@ class StateManager:
             if key not in self.devices:
                 self.devices[key] = Device(device_id=device_id, edge_id=edge_id, first_seen=now, last_seen=now)
             self.devices[key].last_seen = now
-            self.devices[key].status = status
+            # 只更新为更严重的状态，或从offline恢复
+            current_status = self.devices[key].status
+            if status == "online" and current_status == "offline":
+                self.devices[key].status = "online"
+            elif status in ["warning", "danger"]:
+                self.devices[key].status = status
+
+    def update_edge_heartbeat(self, edge_id: str, device_stats: dict, ip_address: str = None):
+        """更新边缘服务器心跳"""
+        with self._lock:
+            now = time.time()
+            if edge_id not in self.edges:
+                self.edges[edge_id] = EdgeServer(
+                    edge_id=edge_id,
+                    first_seen=now,
+                    last_heartbeat=now,
+                    ip_address=ip_address
+                )
+                logger.info(f"🆕 新边缘服务器上线: {edge_id}")
+            else:
+                self.edges[edge_id].last_heartbeat = now
+                self.edges[edge_id].status = "online"
+            self.edges[edge_id].device_count = device_stats.get("total_devices", 0)
+
+    def check_edge_and_device_timeout(self):
+        """检查边缘服务器和设备超时状态"""
+        with self._lock:
+            now = time.time()
+            # 检查边缘服务器超时
+            for edge_id, edge in self.edges.items():
+                if edge.status == "online" and (now - edge.last_heartbeat) > self.edge_timeout:
+                    edge.status = "offline"
+                    logger.warning(f"📴 边缘服务器离线: {edge_id}")
+
+            # 检查设备超时
+            for key, device in self.devices.items():
+                if device.status != "offline" and (now - device.last_seen) > self.device_timeout:
+                    device.status = "offline"
+                    logger.info(f"📴 设备离线: {key}")
 
     def add_record(self, record: InspectionRecord):
         with self._lock:
@@ -133,7 +186,9 @@ class StateManager:
         with self._lock:
             return {
                 "total_devices": len(self.devices),
-                "online_devices": sum(1 for d in self.devices.values() if d.status == "online"),
+                "online_devices": sum(1 for d in self.devices.values() if d.status != "offline"),
+                "total_edges": len(self.edges),
+                "online_edges": sum(1 for e in self.edges.values() if e.status == "online"),
                 "total_inspections": len(self.records),
                 "danger_alerts": sum(1 for r in self.records if r.alert_level == "danger")
             }
@@ -263,10 +318,28 @@ def parse_alert_level(trigger_reason: str, result: str, has_boxes: bool) -> str:
     
     return "normal"
 
-# ================= API 接口 =================
+# ================= FastAPI应用创建 (必须在路由之前) =================
+from contextlib import asynccontextmanager
 
-app = FastAPI(title="Cloud Vision Inspection Center")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """应用生命周期管理 - 替代@on_event(消除弃用警告)"""
+    # 启动时执行
+    asyncio.create_task(check_swift_health())
+    asyncio.create_task(check_device_timeout())
+    asyncio.create_task(check_edge_and_device_connection())  # 新增：检查边缘连接
+    logger.info(f"☁️ 云端视觉巡检中心启动 | 端口:{CLOUD_PORT}")
+    yield
+    # 关闭时执行（预留）
+    logger.info("☁️ 云端视觉巡检中心关闭")
+
+
+# 创建FastAPI实例 - 使用lifespan
+app = FastAPI(title="Cloud Vision Inspection Center", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=TEMP_DIR), name="static")
+
+# ================= API 接口 =================
 
 @app.post("/api/v1/inspect")
 async def inspect(
@@ -327,9 +400,46 @@ async def inspect(
     }
 
 
+class EdgeHeartbeatRequest(BaseModel):
+    """边缘心跳请求"""
+    edge_id: str
+    timestamp: float
+    device_stats: dict
+    devices: Optional[List[dict]] = None  # 完整设备列表（可选）
+    status: str = "online"
+
+
 @app.post("/api/v1/edge_heartbeat")
-async def heartbeat(edge_id: str = Form(...), device_id: str = Form(...)):
-    state.update_device(device_id, edge_id)
+async def heartbeat(request: EdgeHeartbeatRequest):
+    """
+    接收边缘服务器心跳
+    包含设备统计信息和可选的完整设备列表
+    """
+    # 更新边缘服务器状态
+    state.update_edge_heartbeat(
+        edge_id=request.edge_id,
+        device_stats=request.device_stats
+    )
+
+    # 如果提供了完整设备列表，批量更新设备状态
+    if request.devices:
+        for device in request.devices:
+            state.update_device(
+                device_id=device.get("device_id"),
+                edge_id=request.edge_id,
+                status=device.get("status", "online")
+            )
+    else:
+        # 兼容旧版：只更新单个设备（从device_stats推断）
+        total = request.device_stats.get("total_devices", 0)
+        if total > 0:
+            # 至少更新一个设备以保持活跃
+            state.update_device(
+                device_id=f"{request.edge_id}-device",
+                edge_id=request.edge_id,
+                status="online"
+            )
+
     return {"swift_online": swift_online, "status": "ok"}
 
 
@@ -345,16 +455,308 @@ async def get_stats():
 
 @app.get("/api/v1/devices")
 async def get_devices():
-    return {"devices": [
-        {**d.__dict__, "first_seen": datetime.fromtimestamp(d.first_seen).isoformat(),
-         "last_seen": datetime.fromtimestamp(d.last_seen).isoformat()}
-        for d in state.get_devices()
-    ]}
+    """获取所有设备和边缘服务器状态"""
+    with state._lock:
+        devices = [
+            {**d.__dict__, "first_seen": datetime.fromtimestamp(d.first_seen).isoformat(),
+             "last_seen": datetime.fromtimestamp(d.last_seen).isoformat()}
+            for d in state.devices.values()
+        ]
+        edges = [
+            {**e.__dict__, "first_seen": datetime.fromtimestamp(e.first_seen).isoformat(),
+             "last_heartbeat": datetime.fromtimestamp(e.last_heartbeat).isoformat()}
+            for e in state.edges.values()
+        ]
+    return {
+        "devices": devices,
+        "edges": edges,
+        "summary": {
+            "total_edges": len(edges),
+            "online_edges": sum(1 for e in edges if e.get("status") == "online"),
+            "total_devices": len(devices),
+            "online_devices": sum(1 for d in devices if d.get("status") != "offline")
+        }
+    }
 
 
 @app.get("/api/v1/health")
 async def health():
     return {"swift_online": swift_online, "status": "healthy"}
+
+
+# ================= 协同训练扩展接口 (Collaborative Training API) =================
+# 以下接口为未来大小模型协同训练预留，当前仅返回占位数据
+
+class ModelInfo(BaseModel):
+    """模型信息"""
+    model_config = {"protected_namespaces": ()}  # 解决字段名冲突警告
+    model_version: str
+    model_url: Optional[str] = None
+    model_hash: Optional[str] = None
+    release_notes: Optional[str] = None
+    created_at: Optional[float] = None
+
+
+class HardExampleUpload(BaseModel):
+    """难例上传请求"""
+    device_id: str
+    edge_id: str
+    image_base64: str  # Base64编码图像
+    yolo_prediction: Dict  # YOLO预测结果（框+置信度）
+    sc_score: float  # 场景复杂度分数
+    timestamp: float
+    reason: str  # 触发原因
+
+
+class DistillationRequest(BaseModel):
+    """知识蒸馏请求"""
+    device_id: str
+    edge_id: str
+    image_base64: str
+    temperature: float = 2.0  # 蒸馏温度
+
+
+class DistillationResponse(BaseModel):
+    """知识蒸馏响应 - 软标签"""
+    soft_labels: List[float]  # 各类别软概率
+    boxes: List[Dict]  # 边界框坐标
+    feature_map: Optional[str] = None  # Base64编码的特征图（可选）
+    teacher_confidence: float
+
+
+class TrainingTask(BaseModel):
+    """训练任务"""
+    task_id: str
+    task_type: str  # "distillation", "incremental", "finetune"
+    status: str  # "pending", "running", "completed", "failed"
+    progress: float  # 0-100
+    model_version: str
+    created_at: float
+    updated_at: float
+
+
+# ----- 模型管理接口 -----
+
+@app.get("/api/v1/training/model/latest", response_model=ModelInfo)
+async def get_latest_model():
+    """
+    获取最新边缘模型信息
+    边缘服务器定期查询，有新版本则下载更新
+    """
+    # TODO: 实现模型版本管理
+    return ModelInfo(
+        model_version="yolov10n-v1.0.0",
+        model_url=None,  # 预留: "http://47.108.54.154:9000/models/yolov10n-v1.0.0.pt"
+        model_hash=None,  # 预留: SHA256哈希校验
+        release_notes="初始版本",
+        created_at=time.time()
+    )
+
+
+@app.get("/api/v1/training/model/download/{version}")
+async def download_model(version: str):
+    """
+    下载指定版本的模型文件
+    用于边缘服务器增量更新
+    """
+    # TODO: 实现模型文件流式传输
+    raise HTTPException(status_code=501, detail="模型下载功能待实现")
+
+
+@app.get("/api/v1/training/model/versions")
+async def list_model_versions():
+    """获取可用模型版本列表"""
+    # TODO: 实现版本历史管理
+    return {"versions": [], "current": "yolov10n-v1.0.0"}
+
+
+# ----- 难例收集接口 -----
+
+@app.post("/api/v1/training/hard-example")
+async def upload_hard_example(data: HardExampleUpload):
+    """
+    边缘上报难例到云端
+    难例定义：YOLO置信度低(0.3-0.6) 或 SAEC复杂度高 的样本
+    云端收集后用于增量学习和知识蒸馏
+    """
+    logger.info(f"📦 收到难例 | 边缘:{data.edge_id} 设备:{data.device_id} Sc={data.sc_score:.3f}")
+
+    # TODO: 实现难例存储到数据库/对象存储
+    # 1. 保存图像到存储 (如 MinIO/S3)
+    # 2. 保存元数据到数据库
+    # 3. 触发 nightly 训练流水线
+
+    return {
+        "status": "received",
+        "example_id": f"HE-{int(time.time())}",
+        "message": "难例已接收，将用于夜间增量训练"
+    }
+
+
+@app.get("/api/v1/training/hard-examples/stats")
+async def get_hard_example_stats():
+    """获取难例收集统计"""
+    # TODO: 实现统计查询
+    return {
+        "total_collected": 0,
+        "last_24h": 0,
+        "by_edge": {},
+        "pending_labeling": 0
+    }
+
+
+# ----- 知识蒸馏接口 -----
+
+@app.post("/api/v1/training/distill", response_model=DistillationResponse)
+async def get_distillation_labels(request: DistillationRequest):
+    """
+    获取大模型(Qwen3-VL)的软标签用于知识蒸馏
+    边缘YOLO可以用这些软标签进行在线学习
+
+    软标签 vs 硬标签：
+    - 硬标签: [0, 0, 1, 0] (one-hot)
+    - 软标签: [0.1, 0.2, 0.6, 0.1] (概率分布，更多信息)
+    """
+    logger.info(f"🎓 蒸馏请求 | 边缘:{request.edge_id} 温度T={request.temperature}")
+
+    # TODO: 实现真实蒸馏逻辑
+    # 1. 调用 Qwen3-VL 获取预测
+    # 2. 应用温度参数生成软标签
+    # 3. 返回软概率分布
+
+    # 当前返回占位数据
+    return DistillationResponse(
+        soft_labels=[0.1, 0.1, 0.6, 0.2],  # 示例：4类分类的软标签
+        boxes=[],
+        feature_map=None,
+        teacher_confidence=0.85
+    )
+
+
+@app.post("/api/v1/training/distill/batch")
+async def batch_distillation(files: List[UploadFile] = File(...)):
+    """
+    批量获取蒸馏标签
+    用于夜间批量训练
+    """
+    # TODO: 批量处理实现
+    return {"status": "pending", "batch_id": f"BATCH-{int(time.time())}"}
+
+
+# ----- 训练任务管理接口 -----
+
+@app.post("/api/v1/training/task")
+async def create_training_task(task: TrainingTask):
+    """
+    创建训练任务
+    支持: distillation(知识蒸馏), incremental(增量学习), finetune(全量微调)
+    """
+    logger.info(f"🚀 创建训练任务 | 类型:{task.task_type} 版本:{task.model_version}")
+
+    # TODO: 实现任务队列管理 (如使用 Celery + Redis)
+    return {
+        "task_id": task.task_id,
+        "status": "pending",
+        "message": "任务已加入队列"
+    }
+
+
+@app.get("/api/v1/training/task/{task_id}")
+async def get_training_task_status(task_id: str):
+    """查询训练任务状态"""
+    # TODO: 实现任务状态查询
+    return {
+        "task_id": task_id,
+        "status": "pending",
+        "progress": 0.0,
+        "logs": []
+    }
+
+
+@app.get("/api/v1/training/tasks")
+async def list_training_tasks():
+    """列出所有训练任务"""
+    # TODO: 实现任务列表查询
+    return {"tasks": [], "total": 0}
+
+
+@app.delete("/api/v1/training/task/{task_id}")
+async def cancel_training_task(task_id: str):
+    """取消训练任务"""
+    # TODO: 实现任务取消
+    return {"task_id": task_id, "status": "cancelled"}
+
+
+# ----- 增量学习反馈接口 -----
+
+@app.post("/api/v1/training/feedback")
+async def submit_learning_feedback(
+    edge_id: str = Form(...),
+    device_id: str = Form(...),
+    model_version: str = Form(...),
+    feedback_type: str = Form(...),  # "false_positive", "false_negative", "correct"
+    image: UploadFile = File(...),
+    annotation: str = Form("{}")  # JSON格式标注
+):
+    """
+    边缘反馈模型预测结果
+    用于持续改进模型质量
+    """
+    logger.info(f"💬 训练反馈 | 边缘:{edge_id} 类型:{feedback_type}")
+
+    # TODO: 实现反馈收集
+    # 1. 保存反馈图像和标注
+    # 2. 更新模型评估指标
+    # 3. 触发模型再训练（当反馈积累到一定量）
+
+    return {
+        "feedback_id": f"FB-{int(time.time())}",
+        "status": "recorded"
+    }
+
+
+@app.get("/api/v1/training/metrics/{edge_id}")
+async def get_edge_training_metrics(edge_id: str):
+    """
+    获取边缘设备的训练指标
+    用于监控边缘模型性能退化
+    """
+    # TODO: 实现指标收集和查询
+    return {
+        "edge_id": edge_id,
+        "precision": 0.0,
+        "recall": 0.0,
+        "mAP50": 0.0,
+        "inference_time_ms": 0.0,
+        "last_updated": time.time()
+    }
+
+
+# ----- 配置管理接口 -----
+
+@app.get("/api/v1/training/config/{edge_id}")
+async def get_edge_training_config(edge_id: str):
+    """
+    获取边缘训练配置
+    云端统一下发训练超参数
+    """
+    # TODO: 实现配置管理
+    return {
+        "edge_id": edge_id,
+        "learning_rate": 0.001,
+        "batch_size": 16,
+        "epochs": 10,
+        "distillation_alpha": 0.7,  # 蒸馏损失权重
+        "temperature": 2.0,
+        "update_interval_hours": 24
+    }
+
+
+@app.post("/api/v1/training/config/{edge_id}")
+async def update_edge_training_config(edge_id: str, config: Dict):
+    """更新边缘训练配置"""
+    # TODO: 实现配置更新
+    return {"status": "updated", "edge_id": edge_id}
 
 
 # ================= 前端 Dashboard =================
@@ -918,15 +1320,30 @@ async def dashboard():
         const expandedEdges = new Set();
         const expandedDevices = new Set();
 
-        // 组织数据结构
-        function organizeData(devices, records) {
+        // 组织数据结构 - 包含边缘服务器状态
+        function organizeData(devices, records, edgesData) {
             const edgeMap = {};
             
+            // 先初始化边缘服务器数据
+            edgesData.forEach(edge => {
+                edgeMap[edge.edge_id] = {
+                    edge_id: edge.edge_id,
+                    status: edge.status || 'offline',
+                    last_heartbeat: edge.last_heartbeat,
+                    devices: [],
+                    hasAlert: false,
+                    offlineCount: 0,
+                    device_count: edge.device_count || 0
+                };
+            });
+            
+            // 将设备分配到对应边缘
             devices.forEach(device => {
                 const edgeId = device.edge_id || 'UNKNOWN';
                 if (!edgeMap[edgeId]) {
                     edgeMap[edgeId] = {
                         edge_id: edgeId,
+                        status: 'unknown',
                         devices: [],
                         hasAlert: false,
                         offlineCount: 0
@@ -999,24 +1416,28 @@ async def dashboard():
 
             container.innerHTML = edges.map((edge) => {
                 const deviceCount = edge.devices.length;
+                const reportedCount = edge.device_count || deviceCount;
                 const alertCount = edge.devices.reduce((sum, d) => sum + d.alertCount, 0);
                 const hasAlert = edge.hasAlert;
-                const allOffline = edge.offlineCount === deviceCount && deviceCount > 0;
+                const isEdgeOffline = edge.status === 'offline';
+                const allDevicesOffline = edge.offlineCount === deviceCount && deviceCount > 0;
+                const showAsOffline = isEdgeOffline || allDevicesOffline;
 
                 return `
                     <div class="edge-server-card">
-                        <div class="edge-server-header ${hasAlert ? 'has-alert' : ''} ${allOffline ? 'offline' : ''}" 
+                        <div class="edge-server-header ${hasAlert ? 'has-alert' : ''} ${showAsOffline ? 'offline' : ''}" 
                              onclick="toggleEdge('${edge.edge_id}')">
                             <div>
                                 <i class="fas fa-server me-2"></i>
                                 <strong>${edge.edge_id}</strong>
                                 <span class="ms-2" style="font-size: 12px; opacity: 0.9;">
-                                    (${deviceCount}个端侧)
+                                    (${reportedCount}个端侧)
                                 </span>
+                                ${isEdgeOffline ? '<span class="badge bg-secondary ms-1">边缘离线</span>' : ''}
                             </div>
                             <div class="d-flex align-items-center gap-2">
                                 ${alertCount > 0 ? `<span class="badge bg-warning text-dark"><i class="fas fa-bell me-1"></i>${alertCount}</span>` : ''}
-                                ${allOffline ? '<span class="edge-status-badge">离线</span>' : '<span class="edge-status-badge">在线</span>'}
+                                ${showAsOffline ? '<span class="edge-status-badge">离线</span>' : '<span class="edge-status-badge">在线</span>'}
                                 <i class="fas fa-chevron-down expand-icon" id="edge-icon-${edge.edge_id}"></i>
                             </div>
                         </div>
@@ -1259,9 +1680,11 @@ async def dashboard():
                     aiStatus.innerHTML = '<i class="fas fa-circle me-1"></i>AI平台离线';
                 }
 
-                // 更新统计
-                document.getElementById('stat-edges').innerText = new Set(allDevices.map(d => d.edge_id)).size;
-                document.getElementById('stat-devices').innerText = sData.data.online_devices;
+                // 更新统计 - 使用API返回的边缘数据
+                const onlineEdges = dData.summary ? dData.summary.online_edges : new Set(allDevices.map(d => d.edge_id)).size;
+                const onlineDevices = dData.summary ? dData.summary.online_devices : sData.data.online_devices;
+                document.getElementById('stat-edges').innerText = `${onlineEdges}/${sData.data.total_edges || onlineEdges}`;
+                document.getElementById('stat-devices').innerText = `${onlineDevices}/${sData.data.total_devices || onlineDevices}`;
                 document.getElementById('stat-alerts').innerText = sData.data.danger_alerts;
                 
                 totalBoxes = allRecords.reduce((sum, r) => sum + r.boxes.length, 0);
@@ -1270,8 +1693,8 @@ async def dashboard():
                 // 保存当前展开状态
                 saveExpandedState();
 
-                // 组织并渲染层级结构
-                const edges = organizeData(allDevices, allRecords);
+                // 组织并渲染层级结构 - 传入边缘服务器数据
+                const edges = organizeData(allDevices, allRecords, dData.edges || []);
                 renderEdgeServers(edges);
 
                 // 恢复展开状态
@@ -1304,7 +1727,7 @@ async def check_swift_health():
             async with aiohttp.ClientSession() as s:
                 async with s.get(SWIFT_HEALTH_URL, timeout=5) as r:
                     swift_online = (r.status == 200)
-        except: 
+        except:
             swift_online = False
         await asyncio.sleep(10)
 
@@ -1316,11 +1739,12 @@ async def check_device_timeout():
         state.check_device_status_timeout(timeout_seconds=300)  # 5分钟 = 300秒
 
 
-@app.on_event("startup")
-async def startup():
-    asyncio.create_task(check_swift_health())
-    asyncio.create_task(check_device_timeout())
-    logger.info(f"☁️ 云端视觉巡检中心启动 | 端口:{CLOUD_PORT}")
+async def check_edge_and_device_connection():
+    """定时检查边缘服务器和设备连接状态"""
+    while True:
+        await asyncio.sleep(15)  # 每15秒检查一次
+        state.check_edge_and_device_timeout()
+
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=CLOUD_PORT)

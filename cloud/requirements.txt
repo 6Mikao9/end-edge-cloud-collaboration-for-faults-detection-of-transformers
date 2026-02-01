@@ -1,0 +1,30 @@
+# 云端服务器环境依赖
+# 部署到 47.108.54.154 前请执行: pip install -r requirements.txt
+
+# Web框架
+fastapi==0.109.0
+uvicorn[standard]==0.27.0
+python-multipart==0.0.6
+
+# HTTP客户端 (调用Qwen3-VL)
+aiohttp==3.9.1
+
+# 图像处理 (Canvas绘制等)
+opencv-python-headless==4.9.0.75
+numpy==1.26.3
+Pillow==10.2.0
+
+# 数据验证
+pydantic==2.5.3
+
+# 数据库/缓存 (协同训练扩展用)
+# redis==5.0.1  # 训练任务队列
+# sqlalchemy==2.0.25  # 难例数据库
+# alembic==1.13.1  # 数据库迁移
+
+# 对象存储 (模型文件存储)
+# minio==7.2.0  # 模型文件存储
+
+# 监控/日志
+# prometheus-client==0.19.0  # 性能监控
+# python-json-logger==2.0.7  # 结构化日志

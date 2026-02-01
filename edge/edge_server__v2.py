@@ -19,9 +19,15 @@ from threading import Lock
 # ================= 配置区 =================
 YOLO_MODEL_PATH = r"D:\python_projects\dpsk-test\edge\runs\detect\transformer_project\yolov10_test6\weights\best.pt"
 
-# 云端API配置（通过反向SSH隧道访问）
-CLOUD_API_URL = "http://127.0.0.1:9876/api/v1/inspect"  # 本地SSH隧道映射到云端
-CLOUD_HEARTBEAT_URL = "http://127.0.0.1:9876/api/v1/edge_heartbeat"
+# 云端API配置 - 修改为云端服务器公网IP
+# 本地测试用: 127.0.0.1:9876 (SSH隧道)
+# 云端部署用: 47.108.54.154:9876 (公网直连)
+CLOUD_SERVER_HOST = "47.108.54.154"  # <-- 修改为云端公网IP
+CLOUD_SERVER_PORT = 9876
+CLOUD_BASE_URL = f"http://{CLOUD_SERVER_HOST}:{CLOUD_SERVER_PORT}"
+
+CLOUD_API_URL = f"{CLOUD_BASE_URL}/api/v1/inspect"
+CLOUD_HEARTBEAT_URL = f"{CLOUD_BASE_URL}/api/v1/edge_heartbeat"
 EDGE_ID = "EDGE-001"  # 边缘服务器ID
 
 # SAEC配置
@@ -37,8 +43,6 @@ WEIGHTS = {
 
 CONF_THRESHOLD = 0.45
 DEVICE_TIMEOUT = 120  # 设备超时时间（秒）
-
-app = FastAPI(title="Edge Server with Device Management & SAEC")
 
 # 加载边缘模型
 edge_model = None
@@ -283,21 +287,53 @@ def report_to_cloud(image_np: np.ndarray, device_id: str,
 
 
 def send_edge_heartbeat():
-    """边缘服务器向云端发送心跳"""
+    """边缘服务器向云端发送心跳，包含完整设备列表"""
     try:
         stats = device_manager.get_statistics()
+        devices = device_manager.get_all_devices()
+
+        # 构建完整设备列表
+        device_list = []
+        for device_id, device in devices.items():
+            device_list.append({
+                'device_id': device_id,
+                'status': device.status,
+                'last_heartbeat': device.last_heartbeat,
+                'total_uploads': device.total_uploads
+            })
+
         payload = {
             'edge_id': EDGE_ID,
             'timestamp': time.time(),
             'device_stats': stats,
+            'devices': device_list,  # 新增：完整设备列表
             'status': 'online'
         }
         response = requests.post(CLOUD_HEARTBEAT_URL, json=payload, timeout=5)
+        if response.status_code == 200:
+            print(f"💓 心跳发送成功 | 设备数:{len(device_list)} 在线率:{stats.get('online_rate', 0)}%")
         return response.status_code == 200
     except Exception as e:
         print(f"⚠️ 边缘到云端心跳失败: {e}")
         return False
 
+
+# ================= FastAPI应用创建 (必须在路由之前) =================
+from contextlib import asynccontextmanager
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """应用生命周期管理 - 替代@on_event(消除弃用警告)"""
+    print(f"🚀 边缘服务器启动 | ID: {EDGE_ID}")
+    print(f"☁️ 云端服务器: {CLOUD_BASE_URL}")
+    asyncio.create_task(periodic_tasks())
+    yield
+    print("🛑 边缘服务器关闭")
+
+
+# 创建FastAPI实例 - 使用lifespan
+app = FastAPI(title="Edge Server with Device Management & SAEC", lifespan=lifespan)
 
 # ================= API请求模型 =================
 
@@ -461,18 +497,11 @@ async def periodic_tasks():
         offline_devices = device_manager.check_offline_devices()
         if offline_devices:
             print(f"📴 检测到 {len(offline_devices)} 个设备离线")
-        
+
         # 向云端发送心跳
         send_edge_heartbeat()
-        
+
         await asyncio.sleep(30)  # 每30秒执行一次
-
-
-@app.on_event("startup")
-async def startup_event():
-    """启动事件"""
-    asyncio.create_task(periodic_tasks())
-    print(f"🚀 边缘服务器启动 | ID: {EDGE_ID}")
 
 
 if __name__ == "__main__":
