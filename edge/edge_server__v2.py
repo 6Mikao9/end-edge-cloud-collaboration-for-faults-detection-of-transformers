@@ -28,7 +28,7 @@ CLOUD_BASE_URL = f"http://{CLOUD_SERVER_HOST}:{CLOUD_SERVER_PORT}"
 
 CLOUD_API_URL = f"{CLOUD_BASE_URL}/api/v1/inspect"
 CLOUD_HEARTBEAT_URL = f"{CLOUD_BASE_URL}/api/v1/edge_heartbeat"
-EDGE_ID = "EDGE-001"  # 边缘服务器ID
+EDGE_ID = "EDGE-001"  # 边缘服务器ID，用于标记设备
 
 # SAEC配置
 ENABLE_SAEC_ADAPTIVE = True
