@@ -73,7 +73,8 @@ class InspectionRecord:
     trigger_reason: str
     llm_result: Optional[str] = None
     alert_level: str = "normal"
-    boxes: List[List[int]] = field(default_factory=list)  # [y1, x1, y2, x2] 归一化坐标
+    boxes: List[List[int]] = field(default_factory=list)  # Qwen3-VL检测框 [y1, x1, y2, x2]
+    yolo_boxes: List[Dict] = field(default_factory=list)  # YOLO检测框，包含cls/conf/box_norm
 
 # ================= 状态管理 =================
 
@@ -179,7 +180,8 @@ class StateManager:
                 "trigger_reason": r.trigger_reason,
                 "llm_result": r.llm_result,
                 "alert_level": r.alert_level,
-                "boxes": r.boxes
+                "boxes": r.boxes,  # Qwen3-VL检测框
+                "yolo_boxes": r.yolo_boxes  # YOLO检测框
             } for r in self.records]
 
     def get_statistics(self):
@@ -346,7 +348,8 @@ async def inspect(
     image: UploadFile = File(...),
     device_id: str = Form(...),
     edge_id: str = Form(...),
-    trigger_reason: str = Form("unknown")
+    trigger_reason: str = Form("unknown"),
+    yolo_boxes: str = Form("[]")  # JSON字符串，YOLO检测框
 ):
     """接收边缘检测请求，进行AI视觉定位分析"""
     logger.info(f"📥 收到检测 | 设备:{device_id} | 原因:{trigger_reason}")
@@ -362,21 +365,28 @@ async def inspect(
         f.write(await image.read())
     
     state.update_device(device_id, edge_id)
-    
+
+    # 解析YOLO检测框
+    try:
+        yolo_boxes_parsed = json.loads(yolo_boxes)
+    except:
+        yolo_boxes_parsed = []
+    logger.info(f"📦 收到 {len(yolo_boxes_parsed)} 个YOLO检测框")
+
     # AI 分析
     if swift_online:
         prompt = build_grounding_prompt(trigger_reason)
         llm_raw = await call_swift_deploy(save_path, prompt)
     else:
         llm_raw = "AI算力平台离线，请人工复核"
-    
-    # 解析坐标
+
+    # 解析Qwen3-VL坐标
     boxes = extract_qwen_boxes(llm_raw)
-    logger.info(f"🔍 检测到 {len(boxes)} 个定位框")
-    
+    logger.info(f"🔍 Qwen3-VL检测到 {len(boxes)} 个定位框")
+
     # 分级
     alert_level = parse_alert_level(trigger_reason, llm_raw, len(boxes) > 0)
-    
+
     # 记录（Motion 不加入）
     if not is_motion_only:
         record = InspectionRecord(
@@ -388,7 +398,8 @@ async def inspect(
             trigger_reason=trigger_reason,
             llm_result=llm_raw,
             alert_level=alert_level,
-            boxes=boxes
+            boxes=boxes,
+            yolo_boxes=yolo_boxes_parsed
         )
         state.add_record(record)
     
@@ -1164,7 +1175,7 @@ async def dashboard():
             color: #dee2e6;
         }
 
-        /* Modal & Canvas - 保持原有功能 */
+        /* Modal & Canvas - 对比视图布局 */
         #modal {
             display: none;
             position: fixed;
@@ -1177,20 +1188,46 @@ async def dashboard():
             padding: 20px;
         }
 
-        #canvas-wrap {
-            position: relative;
+        /* 对比视图容器 */
+        #canvas-compare-wrap {
+            display: flex;
+            gap: 20px;
+            max-width: 95vw;
+            max-height: 65vh;
+            align-items: flex-start;
+        }
+
+        .canvas-panel {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
             background: #000;
             border-radius: 8px;
             overflow: hidden;
             box-shadow: 0 0 30px rgba(0,0,0,0.8);
-            max-width: 90vw;
-            max-height: 70vh;
         }
 
-        canvas {
+        .canvas-label {
+            width: 100%;
+            padding: 10px 15px;
+            background: linear-gradient(135deg, #1a1a2e 0%, #2d2d44 100%);
+            color: #fff;
+            font-weight: 600;
+            font-size: 14px;
+            text-align: center;
+            border-bottom: 1px solid #333;
+        }
+
+        .canvas-container {
+            position: relative;
+            max-width: 45vw;
+            max-height: 55vh;
+        }
+
+        #yoloCanvas, #llmCanvas {
             display: block;
             max-width: 100%;
-            max-height: 70vh;
+            max-height: 55vh;
         }
 
         .info-box {
@@ -1296,12 +1333,31 @@ async def dashboard():
         </div>
     </div>
 
-    <!-- Modal - 保持原有的框解析功能 -->
+    <!-- Modal - 对比视图：左侧YOLO，右侧Qwen3-VL -->
     <div id="modal" onclick="if(event.target===this)closeModal()">
         <span class="close-btn" onclick="closeModal()">&times;</span>
-        <div id="canvas-wrap">
-            <canvas id="mainCanvas"></canvas>
+
+        <!-- 对比画布区域 -->
+        <div id="canvas-compare-wrap">
+            <div class="canvas-panel">
+                <div class="canvas-label" id="yolo-info">
+                    <span style="color:#ff4444"><i class="fas fa-robot"></i> 边缘YOLO</span>
+                </div>
+                <div class="canvas-container">
+                    <canvas id="yoloCanvas"></canvas>
+                </div>
+            </div>
+            <div class="canvas-panel">
+                <div class="canvas-label" id="llm-info">
+                    <span style="color:#00ff00"><i class="fas fa-brain"></i> 云端Qwen3-VL</span>
+                </div>
+                <div class="canvas-container">
+                    <canvas id="llmCanvas"></canvas>
+                </div>
+            </div>
         </div>
+
+        <!-- 信息区域 -->
         <div class="info-box">
             <h4 id="m-title" style="margin-top:0; color:#58a6ff;"></h4>
             <p id="m-text" style="line-height:1.6; color:#c9d1d9; white-space:pre-wrap;"></p>
@@ -1596,55 +1652,117 @@ async def dashboard():
             }
         }
 
-        // 显示详情模态框 - 保持原有框解析功能
+        // 显示详情模态框 - 对比视图：左侧YOLO，右侧Qwen3-VL
         function showDetail(r) {
             const modal = document.getElementById('modal');
-            const canvas = document.getElementById('mainCanvas');
-            const ctx = canvas.getContext('2d');
+            const leftCanvas = document.getElementById('yoloCanvas');
+            const rightCanvas = document.getElementById('llmCanvas');
+            const leftCtx = leftCanvas.getContext('2d');
+            const rightCtx = rightCanvas.getContext('2d');
             const img = new Image();
-            
-            img.onload = () => {
-                canvas.width = img.width;
-                canvas.height = img.height;
-                
-                ctx.drawImage(img, 0, 0);
-                
-                // 绘制检测框
-                ctx.strokeStyle = '#00ff00';
-                ctx.lineWidth = Math.max(img.width / 200, 3);
-                ctx.shadowBlur = 10;
-                ctx.shadowColor = '#00ff00';
-                
-                r.boxes.forEach((box, idx) => {
-                    const [y1, x1, y2, x2] = box;
-                    const rx = (x1 / 1000) * img.width;
-                    const ry = (y1 / 1000) * img.height;
-                    const rw = ((x2 - x1) / 1000) * img.width;
-                    const rh = ((y2 - y1) / 1000) * img.height;
-                    
-                    ctx.strokeRect(rx, ry, rw, rh);
-                    
-                    ctx.fillStyle = '#00ff00';
-                    ctx.font = `bold ${Math.max(14, img.width/40)}px Arial`;
-                    ctx.fillText(`#${idx+1}`, rx + 4, ry - 6);
-                });
-                
-                ctx.shadowBlur = 0;
 
+            img.onload = () => {
+                // 设置画布大小
+                leftCanvas.width = img.width;
+                leftCanvas.height = img.height;
+                rightCanvas.width = img.width;
+                rightCanvas.height = img.height;
+
+                // 绘制原始图像
+                leftCtx.drawImage(img, 0, 0);
+                rightCtx.drawImage(img, 0, 0);
+
+                // ===== 左侧：YOLO检测框（红色） =====
+                leftCtx.strokeStyle = '#ff4444';
+                leftCtx.lineWidth = Math.max(img.width / 200, 3);
+                leftCtx.shadowBlur = 10;
+                leftCtx.shadowColor = '#ff4444';
+
+                if (r.yolo_boxes && r.yolo_boxes.length > 0) {
+                    r.yolo_boxes.forEach((box, idx) => {
+                        const [y1, x1, y2, x2] = box.box_norm;
+                        const rx = (x1 / 1000) * img.width;
+                        const ry = (y1 / 1000) * img.height;
+                        const rw = ((x2 - x1) / 1000) * img.width;
+                        const rh = ((y2 - y1) / 1000) * img.height;
+
+                        leftCtx.strokeRect(rx, ry, rw, rh);
+
+                        // 标签
+                        leftCtx.fillStyle = '#ff4444';
+                        leftCtx.font = `bold ${Math.max(14, img.width/40)}px Arial`;
+                        const label = `YOLO-${idx+1} ${(box.conf * 100).toFixed(0)}%`;
+                        leftCtx.fillText(label, rx + 4, ry - 6);
+                    });
+                } else {
+                    // 无YOLO检测框提示
+                    leftCtx.fillStyle = 'rgba(255, 255, 255, 0.8)';
+                    leftCtx.fillRect(10, 10, 200, 30);
+                    leftCtx.fillStyle = '#ff4444';
+                    leftCtx.font = `bold 16px Arial`;
+                    leftCtx.fillText('YOLO: 未检测到目标', 20, 32);
+                }
+
+                // ===== 右侧：Qwen3-VL检测框（绿色） =====
+                rightCtx.strokeStyle = '#00ff00';
+                rightCtx.lineWidth = Math.max(img.width / 200, 3);
+                rightCtx.shadowBlur = 10;
+                rightCtx.shadowColor = '#00ff00';
+
+                if (r.boxes && r.boxes.length > 0) {
+                    r.boxes.forEach((box, idx) => {
+                        const [y1, x1, y2, x2] = box;
+                        const rx = (x1 / 1000) * img.width;
+                        const ry = (y1 / 1000) * img.height;
+                        const rw = ((x2 - x1) / 1000) * img.width;
+                        const rh = ((y2 - y1) / 1000) * img.height;
+
+                        rightCtx.strokeRect(rx, ry, rw, rh);
+
+                        rightCtx.fillStyle = '#00ff00';
+                        rightCtx.font = `bold ${Math.max(14, img.width/40)}px Arial`;
+                        rightCtx.fillText(`LLM-${idx+1}`, rx + 4, ry - 6);
+                    });
+                } else {
+                    // 无LLM检测框提示
+                    rightCtx.fillStyle = 'rgba(255, 255, 255, 0.8)';
+                    rightCtx.fillRect(10, 10, 200, 30);
+                    rightCtx.fillStyle = '#00ff00';
+                    rightCtx.font = `bold 16px Arial`;
+                    rightCtx.fillText('Qwen3-VL: 未标注区域', 20, 32);
+                }
+
+                leftCtx.shadowBlur = 0;
+                rightCtx.shadowBlur = 0;
+
+                // 更新信息
                 document.getElementById('m-title').innerText = `${r.trigger_reason} [${r.alert_level.toUpperCase()}]`;
                 document.getElementById('m-text').innerText = r.llm_result || '无分析结果';
+
+                // 更新对比信息
+                const yoloCount = r.yolo_boxes ? r.yolo_boxes.length : 0;
+                const llmCount = r.boxes ? r.boxes.length : 0;
+                document.getElementById('yolo-info').innerHTML = `
+                    <span style="color:#ff4444"><i class="fas fa-robot"></i> 边缘YOLO</span>
+                    <br>检测到 ${yoloCount} 个目标
+                `;
+                document.getElementById('llm-info').innerHTML = `
+                    <span style="color:#00ff00"><i class="fas fa-brain"></i> 云端Qwen3-VL</span>
+                    <br>标注了 ${llmCount} 个区域
+                `;
+
                 modal.style.display = 'flex';
             };
-            
+
             img.onerror = () => {
                 alert('图像加载失败');
             };
-            
+
             img.src = r.image_url;
         }
 
-        function closeModal() { 
-            document.getElementById('modal').style.display = 'none'; 
+        function closeModal() {
+            document.getElementById('modal').style.display = 'none';
         }
 
         // ESC关闭

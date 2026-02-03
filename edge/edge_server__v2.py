@@ -17,18 +17,19 @@ from dataclasses import dataclass, field
 from threading import Lock
 
 # ================= 配置区 =================
-YOLO_MODEL_PATH = r"D:\python_projects\dpsk-test\edge\runs\detect\transformer_project\yolov10_test6\weights\best.pt"
+YOLO_MODEL_PATH = r"D:\python_projects\dpsk-test\edge\runs\detect\transformer_project\yolov10_optimized5\weights\best.pt"
 
-# 云端API配置 - 修改为云端服务器公网IP
-# 本地测试用: 127.0.0.1:9876 (SSH隧道)
-# 云端部署用: 47.108.54.154:9876 (公网直连)
-CLOUD_SERVER_HOST = "47.108.54.154"  # <-- 修改为云端公网IP
-CLOUD_SERVER_PORT = 9876
+# 云端API配置
+# 本地开发测试: 127.0.0.1:9876
+# 云端部署: 47.108.54.154:9876
+import os
+CLOUD_SERVER_HOST = os.getenv("CLOUD_SERVER_HOST", "127.0.0.1")  # 默认本地
+CLOUD_SERVER_PORT = int(os.getenv("CLOUD_SERVER_PORT", "9876"))
 CLOUD_BASE_URL = f"http://{CLOUD_SERVER_HOST}:{CLOUD_SERVER_PORT}"
 
 CLOUD_API_URL = f"{CLOUD_BASE_URL}/api/v1/inspect"
 CLOUD_HEARTBEAT_URL = f"{CLOUD_BASE_URL}/api/v1/edge_heartbeat"
-EDGE_ID = "EDGE-001"  # 边缘服务器ID，用于标记设备
+EDGE_ID = os.getenv("EDGE_ID", "EDGE-001")  # 边缘服务器ID，用于标记设备
 
 # SAEC配置
 ENABLE_SAEC_ADAPTIVE = True
@@ -259,8 +260,9 @@ class SAEC_Estimator:
 # ================= 云端通信 =================
 
 def report_to_cloud(image_np: np.ndarray, device_id: str, 
-                    yolo_detections: int, reason: str, skip_llm: bool = False):
-    """上报到云端服务器（不传递场景复杂度）"""
+                    yolo_detections: int, reason: str, skip_llm: bool = False,
+                    yolo_boxes: list = None):
+    """上报到云端服务器，包含YOLO检测框"""
     try:
         _, img_encoded = cv2.imencode('.jpg', image_np)
         img_bytes = img_encoded.tobytes()
@@ -270,7 +272,8 @@ def report_to_cloud(image_np: np.ndarray, device_id: str,
             'device_id': device_id,
             'edge_id': EDGE_ID,
             'trigger_reason': reason,
-            'skip_llm': str(skip_llm)  # 火灾等紧急情况可跳过LLM直接显示
+            'skip_llm': str(skip_llm),
+            'yolo_boxes': json.dumps(yolo_boxes or [])  # YOLO检测框
         }
         
         response = requests.post(CLOUD_API_URL, files=files, data=data, timeout=30)
@@ -396,11 +399,27 @@ async def predict(
         sc_score, sc_details = SAEC_Estimator.get_sc_score(img)
         is_complex = sc_score > SC_THRESHOLD
         
-        # 2. 边缘YOLO检测
+        # 2. 边缘YOLO检测 - 获取检测框用于云端对比显示
         yolo_detections = 0
+        yolo_boxes = []
         if edge_model:
             yolo_res = edge_model.predict(img, conf=CONF_THRESHOLD, verbose=False)[0]
             yolo_detections = len(yolo_res.boxes)
+            img_h, img_w = img.shape[:2]
+            for box in yolo_res.boxes:
+                x1, y1, x2, y2 = box.xyxy[0].tolist()
+                # 转换为归一化坐标 (0-1000)，与Qwen3-VL格式一致 [y1, x1, y2, x2]
+                yolo_boxes.append({
+                    "cls": int(box.cls),
+                    "conf": float(box.conf),
+                    "box_norm": [
+                        int(y1 / img_h * 1000),  # y1
+                        int(x1 / img_w * 1000),  # x1
+                        int(y2 / img_h * 1000),  # y2
+                        int(x2 / img_w * 1000)   # x2
+                    ],
+                    "box_px": [int(x1), int(y1), int(x2), int(y2)]  # 像素坐标
+                })
         
         # 3. 协同调度决策
         decision = "Edge_Only"
@@ -417,21 +436,23 @@ async def predict(
                 device_id, 
                 yolo_detections,
                 reason,
-                skip_llm=False  # 火灾仍需LLM确认，但前端先显示
+                skip_llm=False,
+                yolo_boxes=yolo_boxes
             )
         elif ENABLE_SAEC_ADAPTIVE:
             # 场景复杂或YOLO无信心时触发云端
             if is_complex or (yolo_detections == 0 and sc_score > 0.4):
                 print(f"🚀 [协同调度] 设备:{device_id} 场景复杂(Sc={sc_score}), 触发云端MLLM")
                 decision = "Edge_Cloud_Collaborative"
-                # 异步上报云端
+                # 异步上报云端，携带YOLO检测框
                 background_tasks.add_task(
                     report_to_cloud, 
                     img.copy(), 
                     device_id, 
                     yolo_detections,
                     reason,
-                    skip_llm=False
+                    skip_llm=False,
+                    yolo_boxes=yolo_boxes
                 )
         
         results_manifest.append({
