@@ -16,36 +16,21 @@ from ultralytics import YOLO
 from dataclasses import dataclass, field
 from threading import Lock
 
-# ================= 配置区 =================
-YOLO_MODEL_PATH = r"D:\python_projects\dpsk-test\edge\runs\detect\transformer_project\yolov10_optimized5\weights\best.pt"
+# ================= 导入配置 =================
+from config import (
+    EDGE_ID, EDGE_SERVER_HOST, EDGE_SERVER_PORT,
+    CLOUD_API_URL, CLOUD_HEARTBEAT_URL, CLOUD_BASE_URL,
+    YOLO_MODEL_PATH, CONF_THRESHOLD,
+    ENABLE_SAEC_ADAPTIVE, SC_THRESHOLD, SAEC_COMPLEXITY_TRIGGER, WEIGHTS,
+    DEVICE_TIMEOUT,
+    ENABLE_AUTO_MODEL_UPDATE, MODEL_CHECK_INTERVAL,
+    HARD_EXAMPLE_THRESHOLD, HARD_EXAMPLE_CACHE_DIR,
+    DEBUG_INFERENCE, DEBUG_SAVE_IMAGES, DEBUG_OUTPUT_DIR,
+    save_debug_image, debug_print_inference,
+    print_config
+)
 
-# 云端API配置
-# 本地开发测试: 127.0.0.1:9876
-# 云端部署: 47.108.54.154:9876
-import os
-CLOUD_SERVER_HOST = os.getenv("CLOUD_SERVER_HOST", "127.0.0.1")  # 默认本地
-CLOUD_SERVER_PORT = int(os.getenv("CLOUD_SERVER_PORT", "9876"))
-CLOUD_BASE_URL = f"http://{CLOUD_SERVER_HOST}:{CLOUD_SERVER_PORT}"
-
-CLOUD_API_URL = f"{CLOUD_BASE_URL}/api/v1/inspect"
-CLOUD_HEARTBEAT_URL = f"{CLOUD_BASE_URL}/api/v1/edge_heartbeat"
-EDGE_ID = os.getenv("EDGE_ID", "EDGE-001")  # 边缘服务器ID，用于标记设备
-
-# SAEC配置
-ENABLE_SAEC_ADAPTIVE = True
-SC_THRESHOLD = 6.36
-WEIGHTS = {
-    "entropy": 0.25,      # 灰度级熵
-    "edge": 0.20,         # 边缘密度
-    "sharpness": 0.20,    # 拉普拉斯方差
-    "gradient": 0.20,     # 梯度幅值
-    "jpeg_residual": 0.15 # JPEG残差
-}
-
-CONF_THRESHOLD = 0.45
-DEVICE_TIMEOUT = 120  # 设备超时时间（秒）
-
-# 加载边缘模型
+# ================= 加载边缘模型 =================
 edge_model = None
 if os.path.exists(YOLO_MODEL_PATH):
     edge_model = YOLO(YOLO_MODEL_PATH)
@@ -328,8 +313,8 @@ from contextlib import asynccontextmanager
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """应用生命周期管理 - 替代@on_event(消除弃用警告)"""
-    print(f"🚀 边缘服务器启动 | ID: {EDGE_ID}")
-    print(f"☁️ 云端服务器: {CLOUD_BASE_URL}")
+    # 打印配置信息
+    print_config()
     asyncio.create_task(periodic_tasks())
     yield
     print("🛑 边缘服务器关闭")
@@ -420,41 +405,54 @@ async def predict(
                     ],
                     "box_px": [int(x1), int(y1), int(x2), int(y2)]  # 像素坐标
                 })
-        
+
         # 3. 协同调度决策
         decision = "Edge_Only"
-        
+
         # 火灾直接上报，不经过复杂度判断
         is_fire = "FIRE" in reason.upper()
-        
+
         if is_fire:
             print(f"🔥 [火灾告警] 设备:{device_id} 检测到火灾，立即上报云端！")
             decision = "Fire_Alert_Direct"
             background_tasks.add_task(
-                report_to_cloud, 
-                img.copy(), 
-                device_id, 
+                report_to_cloud,
+                img.copy(),
+                device_id,
                 yolo_detections,
                 reason,
                 skip_llm=False,
                 yolo_boxes=yolo_boxes
             )
         elif ENABLE_SAEC_ADAPTIVE:
-            # 场景复杂或YOLO无信心时触发云端
-            if is_complex or (yolo_detections == 0 and sc_score > 0.4):
+            # 场景复杂或YOLO检测出了结果时触发云端
+            if is_complex or (yolo_detections != 0):
                 print(f"🚀 [协同调度] 设备:{device_id} 场景复杂(Sc={sc_score}), 触发云端MLLM")
                 decision = "Edge_Cloud_Collaborative"
                 # 异步上报云端，携带YOLO检测框
                 background_tasks.add_task(
-                    report_to_cloud, 
-                    img.copy(), 
-                    device_id, 
+                    report_to_cloud,
+                    img.copy(),
+                    device_id,
                     yolo_detections,
                     reason,
                     skip_llm=False,
                     yolo_boxes=yolo_boxes
                 )
-        
+
+        # ===== 调试输出 =====
+        debug_print_inference(
+            filename=file.filename,
+            sc_score=sc_score,
+            yolo_count=yolo_detections,
+            yolo_boxes=yolo_boxes,
+            decision=decision,
+            device_id=device_id
+        )
+
+        # 保存调试图像（如果启用）
+        save_debug_image(img, yolo_boxes, filename_prefix=f"{device_id}_{int(time.time())}")
+
         results_manifest.append({
             "filename": file.filename,
             "sc_score": sc_score,

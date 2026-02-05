@@ -204,22 +204,13 @@ state = StateManager()
 # ================= 核心工具：Qwen3-VL 坐标解析 =================
 
 def extract_qwen_boxes(text: str) -> List[List[int]]:
-    """
-    解析 Qwen3-VL 视觉定位坐标
-    格式: <|box_start|>(y1,x1,y2,x2)<|box_end|>
-    坐标范围: 0-1000 (归一化)
-    顺序: [y1, x1, y2, x2] (注意 y 在前!)
-    
-    返回: List[[y1, x1, y2, x2], ...]
-    """
+    """解析 Qwen3-VL 视觉定位坐标（已修正正则表达式）"""
     if not text:
         return []
-    
-    # 匹配 <|box_start|>(y1,x1,y2,x2)<|box_end|>
-    pattern = r"<\|box_start\|>\((\d+),(\d+),(\d+),(\d+)\)<\|box_end\|>"
+    # ✅ 修正：匹配两个坐标点 (x1,y1),(x2,y2)
+    pattern = r"<box>\s*\((\d+),(\d+)\),\s*\((\d+),(\d+)\)\s*</box>"
     matches = re.findall(pattern, text)
-    
-    # 转换为整数列表 [[y1, x1, y2, x2], ...]
+    # 转换为整数列表 [[x1, y1, x2, y2], ...]
     boxes = [[int(c) for c in m] for m in matches]
     return boxes
 
@@ -276,30 +267,13 @@ async def call_swift_deploy(image_path: str, prompt: str, temperature: float = 0
 
 
 def build_grounding_prompt(trigger_reason: str) -> str:
-    """构建带视觉定位指令的 Prompt"""
-    
-    base_instruction = """请作为电力设备巡检专家，仔细分析这张图像。
-
-任务要求：
-1. 检查是否存在异常、火情、设备损坏或安全隐患
-2. 如果发现问题，请详细描述异常位置和特征
-3. **重要：用坐标框出异常区域** 
-
-坐标格式说明：
-- 使用 <|box_start|>(y1,x1,y2,x2)<|box_end|> 标记位置
-- 坐标范围 0-1000，y 在前 x 在后
-- 例如：变压器漏油点 <|box_start|>(300,150,450,400)<|box_end|>
-
-请用中文回复，包含：
-1. 整体状态评估
-2. 具体问题描述（如有）
-3. 异常位置的坐标标记"""
-
+    """构建带视觉定位指令的 Prompt（已修正坐标格式）"""
+    #base_instruction = """【设备视觉分析】请结合电力运行规程，对该图像中的设施状态进行安全合规性检查，定位潜在的风险隐患。任务要求：1. 检查是否存在如漏油(最常见）等异常、设备损坏或安全隐患但是请在遵循不放过问题的基础上尽量避免误报，即不要把好的设备也报为故障设备2. 如果发现问题，请详细描述异常位置和特征3. **重要：用坐标框出异常区域** 坐标格式说明：- 使用 <box>(x1,y1),(x2,y2)</box> 标记位置- 坐标范围 0-1000，x 在前 y 在后- 例如：变压器漏油点 <box>(150,300),(400,450)</box>请用中文回复，包含：1. 整体状态评估2. 具体问题描述（如有）3. 异常位置的坐标标记"""
+    base_instruction = """【设备视觉分析】请结合电力运行规程，对该图像中的设施状态进行安全合规性检查，定位潜在的风险隐患"""
     if "FIRE" in trigger_reason.upper():
         return f"{base_instruction}\n\n【重点关注】检测到火灾告警，请仔细检查明火、烟雾、过热区域，并用坐标框出所有可疑位置。"
     else:
         return f"{base_instruction}\n\n【触发原因】{trigger_reason}"
-
 
 def parse_alert_level(trigger_reason: str, result: str, has_boxes: bool) -> str:
     """解析告警级别"""
@@ -1711,7 +1685,7 @@ async def dashboard():
 
                 if (r.boxes && r.boxes.length > 0) {
                     r.boxes.forEach((box, idx) => {
-                        const [y1, x1, y2, x2] = box;
+                        const [x1, y1, x2, y2] = box; // 关键：顺序为 [x1, y1, x2, y2]
                         const rx = (x1 / 1000) * img.width;
                         const ry = (y1 / 1000) * img.height;
                         const rw = ((x2 - x1) / 1000) * img.width;

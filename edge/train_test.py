@@ -12,7 +12,7 @@ def train_best_strategy(task_mode='rgb'):
     # 根据任务模式定制参数
     if task_mode == 'rgb':
         # 针对新增数百张漏油数据的 RGB 优化版
-        data_path = r"D:\python_projects\dpsk-test\edge\datasets\yolo_train_data\data.yaml"
+        data_path = r"D:\python_projects\dpsk-test\edge\datasets\yolo_rgb_dataset\data.yaml"
         special_params = {
             "batch": 16,  # 数据多了，Batch Size 调大能显著稳定梯度
             "copy_paste": 0.3,  # 略微降低，因为新数据多了，不需要像以前那样疯狂“粘贴”

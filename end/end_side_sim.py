@@ -11,6 +11,24 @@ from datetime import datetime
 import config
 
 
+# ================= 调试工具函数 =================
+def debug_print_frame_info(frame_count, trigger_reason, fire_ratio=None, motion_ratio=None):
+    """打印帧处理调试信息"""
+    if not config.DEBUG_MODE:
+        return
+    
+    timestamp = datetime.now().strftime("%H:%M:%S")
+    if trigger_reason:
+        print(f"[{timestamp}] 🔔 帧{frame_count} 触发: {trigger_reason}")
+        if fire_ratio:
+            print(f"           🔥 火焰占比: {fire_ratio:.4f} (阈值: {config.FIRE_PIXEL_RATIO})")
+        if motion_ratio:
+            print(f"           🏃 运动占比: {motion_ratio:.4f} (阈值: {config.MOTION_AREA_RATIO})")
+    else:
+        if frame_count % 100 == 0:  # 每100帧打印一次正常信息
+            print(f"[{timestamp}] ✓ 帧{frame_count} 正常处理中...")
+
+
 class EndSideSimulator:
     """
     端侧设备模拟器
@@ -27,7 +45,7 @@ class EndSideSimulator:
                  motion_diff_threshold=None, motion_area_ratio=None,
                  gaussian_blur_size=None, sync_interval=None,
                  post_trigger_frames=None, frame_skip=None,
-                 edge_url=None, heartbeat_interval=30):
+                 edge_url=None, heartbeat_interval=10):
 
         self.video_path = video_path or config.VIDEO_PATH
         self.debug_output_dir = debug_output_dir
@@ -132,14 +150,28 @@ class EndSideSimulator:
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
         mask = cv2.inRange(hsv, np.array([0, 100, 200]), np.array([35, 255, 255]))
         fire_ratio = np.sum(mask > 0) / mask.size
-        return fire_ratio > self.fire_pixel_ratio or np.mean(gray) > self.fire_brightness_threshold
+        is_fire = fire_ratio > self.fire_pixel_ratio or np.mean(gray) > self.fire_brightness_threshold
+        
+        # 调试输出
+        if config.DEBUG_MODE and fire_ratio > 0.001:
+            print(f"    🔥 火焰检测: 占比={fire_ratio:.4f}, 亮度={np.mean(gray):.1f}")
+        
+        return is_fire, fire_ratio
 
     def detect_motion(self, gray):
-        if self.last_gray is None: return False
+        if self.last_gray is None:
+            return False, 0.0
         diff = cv2.absdiff(gray, self.last_gray)
         _, thresh = cv2.threshold(diff, self.motion_diff_threshold, 255, cv2.THRESH_BINARY)
         thresh = cv2.dilate(thresh, np.ones((5, 5), np.uint8), iterations=1)
-        return (np.sum(thresh == 255) / thresh.size) > self.motion_area_ratio
+        motion_ratio = np.sum(thresh == 255) / thresh.size
+        is_motion = motion_ratio > self.motion_area_ratio
+        
+        # 调试输出
+        if config.DEBUG_MODE and motion_ratio > 0.01:
+            print(f"    🏃 运动检测: 占比={motion_ratio:.4f}")
+        
+        return is_motion, motion_ratio
 
     def send_heartbeat(self):
         """发送心跳包到边缘服务器"""
@@ -165,18 +197,25 @@ class EndSideSimulator:
         except Exception as e:
             print(f"⚠️ 心跳发送失败: {e}")
 
-    def process_frame(self, frame):
+    def process_frame(self, frame, frame_count=0):
         small_frame = cv2.resize(frame, (640, 480))
         blurred = cv2.GaussianBlur(small_frame, (self.gaussian_blur_size, self.gaussian_blur_size), 0)
         gray = cv2.cvtColor(blurred, cv2.COLOR_BGR2GRAY)
 
+        # 检测火灾和运动
+        is_fire, fire_ratio = self.detect_fire(small_frame, gray)
+        is_motion, motion_ratio = self.detect_motion(gray)
+
         trigger_reason = None
-        if self.detect_fire(small_frame, gray):
+        if is_fire:
             trigger_reason = "Fire_Alarm"
-        elif self.detect_motion(gray):
+        elif is_motion:
             trigger_reason = "Motion_Change"
         elif (time.time() - self.last_sync_time > self.sync_interval):
             trigger_reason = "Timer_Sync"
+
+        # 调试输出
+        debug_print_frame_info(frame_count, trigger_reason, fire_ratio if is_fire else None, motion_ratio if is_motion else None)
 
         self.last_gray = gray
         return trigger_reason, small_frame
@@ -226,9 +265,10 @@ class EndSideSimulator:
 
                 # 只有到达采样间隔才推理
                 if current_time - self.last_inference_time >= self.inference_interval:
-                    trigger_reason, _ = self.process_frame(frame)
+                    trigger_reason, _ = self.process_frame(frame, frame_count)
                     self.last_inference_time = current_time
                     if trigger_reason:
+                        print(f"📤 [{datetime.now().strftime('%H:%M:%S')}] 设备 {self.device_id} 上报: {trigger_reason}")
                         frames_to_send = [frame] + self.capture_frames(self.post_trigger_frames)
                         self.send_to_edge(frames_to_send, trigger_reason)
                         self.last_sync_time = current_time
@@ -270,8 +310,11 @@ class EndSideSimulator:
 
 
 if __name__ == "__main__":
+    # 打印配置信息
+    config.print_config()
+    
     # 支持命令行参数指定设备ID前缀
     device_prefix = sys.argv[1] if len(sys.argv) > 1 else None
     
-    simulator = EndSideSimulator(inference_interval=2.0)
+    simulator = EndSideSimulator(inference_interval=config.INFERENCE_INTERVAL)
     simulator.run(show_preview=True)
